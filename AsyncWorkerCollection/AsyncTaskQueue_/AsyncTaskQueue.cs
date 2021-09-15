@@ -97,6 +97,12 @@ namespace dotnetCampus.Threading
             //添加队列，加锁。
             lock (Locker)
             {
+                if (_isDisposing || _isDisposed)
+                {
+                    task.SetNotExecutable();
+                    return;
+                }
+
                 _queue.Enqueue(task);
                 //开始执行任务
                 _autoResetEvent.Set();
@@ -116,10 +122,14 @@ namespace dotnetCampus.Threading
 
                 lock (Locker)
                 {
-                    if (_isDisposed)
+                    if (_isDisposing || _isDisposed)
                     {
-                        Debug.Assert(_isDisposing);
-                        return;
+                        // 理论上判断 _isDisposed 为 true 时，此时 _isDisposing 一定为 true 的值
+                        // 但是如果是在 _autoResetEvent 被释放时，由此线程进入到此判断里面
+                        // 那么 _isDisposing 为 true 但 _isDisposed 为 false 的值
+                        // 原因在于 _isDisposed 等待 _autoResetEvent 释放之后，再设置为 true 的值
+                        // 同时因为进入的线程是在释放 _autoResetEvent 的线程，因此 lock (Locker) 无效
+                        return; 
                     }
 
                     // 在锁里获取异步锁，这样可以解决在释放的时候，调用异步锁已被释放
@@ -132,7 +142,17 @@ namespace dotnetCampus.Threading
                 if (shouldWaitOneTask)
                 {
                     //等待后续任务
-                    await waitOneTask.ConfigureAwait(false);
+                   var result = await waitOneTask.ConfigureAwait(false);
+
+                   if (result is false)
+                   {
+                        // 啥时候是 false 的值？在 _autoResetEvent 被释放的时候
+                        // 此时将会因为其他线程调用 _autoResetEvent 的 Dispose 方法而继续往下走
+                        // 此时在 Dispose 方法里面是获得了 Locker 这个对象的锁。也就是说此时如果判断 _isDisposed 属性，是一定是 false 的值。原因是 _isDisposed 的设置是在 Locker 锁里面，同时也在 _autoResetEvent 被释放之后。尽管有在外层的 while (!_isDisposing) 进行一次判断，然而此获取非线程安全。因此需要进行三步判断才能是安全的
+                        // 第一步是最外层的 while (!_isDisposing) 进行判断。第二步是进入 Locker 锁时，同时判断 _isDisposing 和 _isDisposed 对象（其实判断 _isDisposing 即可）不过多余的判断没有什么锅
+                        // 第三步是此分支，如果当前释放了，那就应该返回了
+                        return;
+                   }
                 }
 
                 while (TryGetNextTask(out var task))
